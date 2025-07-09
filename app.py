@@ -1,4 +1,4 @@
-""" Basic Agent Evaluation Runner"""
+import json
 import os
 import inspect
 import gradio as gr
@@ -7,29 +7,28 @@ import pandas as pd
 from langchain_core.messages import HumanMessage
 from agent import build_graph
 
-
-
 # (Keep Constants as is)
 # --- Constants ---
 DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
+DEBUG = False
 
 # --- Basic Agent Definition ---
 # ----- THIS IS WERE YOU CAN BUILD WHAT YOU WANT ------
-
 
 class BasicAgent:
     """A langgraph agent."""
     def __init__(self):
         print("BasicAgent initialized.")
-        self.graph = build_graph()
+        self.graph = build_graph("groq")
 
     def __call__(self, question: str) -> str:
         print(f"Agent received question (first 50 chars): {question[:50]}...")
         # Wrap the question in a HumanMessage from langchain_core
-        messages = [HumanMessage(content=question)]
-        messages = self.graph.invoke({"messages": messages})
-        answer = messages['messages'][-1].content
-        return answer[14:]
+        try:
+            result = self.graph.invoke({"messages": [HumanMessage(content=question)]})
+            return result["messages"][-1].content
+        except Exception as e:
+            return f"Error processing question: {str(e)}"
 
 
 def run_and_submit_all( profile: gr.OAuthProfile | None):
@@ -40,6 +39,8 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
     # --- Determine HF Space Runtime URL and Repo URL ---
     space_id = os.getenv("SPACE_ID") # Get the SPACE_ID for sending link to the code
 
+    debug = DEBUG
+
     if profile:
         username= f"{profile.username}"
         print(f"User logged in: {username}")
@@ -48,9 +49,11 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
         return "Please Login to Hugging Face with the button.", None
 
     api_url = DEFAULT_API_URL
-    questions_url = f"{api_url}/questions"
+    all_questions_url = f"{api_url}/questions"
+    random_question_url = f"{api_url}/random-question"
     submit_url = f"{api_url}/submit"
-
+    questions_url = random_question_url if debug else all_questions_url
+    
     # 1. Instantiate Agent ( modify this part to create your agent)
     try:
         agent = BasicAgent()
@@ -66,7 +69,13 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
     try:
         response = requests.get(questions_url, timeout=15)
         response.raise_for_status()
-        questions_data = response.json()
+        questions_data = []
+        if debug:
+            print(f"Debug mode: Fetched questions data: {response.json()}...")  # Show first 3 items for brevity
+            questions_data.append(response.json())
+        else:
+            print(f"Fetched questions data: {response.json()}...")
+            questions_data = response.json()
         if not questions_data:
              print("Fetched questions list is empty.")
              return "Fetched questions list is empty or invalid format.", None
@@ -74,10 +83,6 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
     except requests.exceptions.RequestException as e:
         print(f"Error fetching questions: {e}")
         return f"Error fetching questions: {e}", None
-    except requests.exceptions.JSONDecodeError as e:
-         print(f"Error decoding JSON response from questions endpoint: {e}")
-         print(f"Response text: {response.text[:500]}")
-         return f"Error decoding server response for questions: {e}", None
     except Exception as e:
         print(f"An unexpected error occurred fetching questions: {e}")
         return f"An unexpected error occurred fetching questions: {e}", None
@@ -93,12 +98,13 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
             print(f"Skipping item with missing task_id or question: {item}")
             continue
         try:
-            submitted_answer = agent(question_text)
-            answers_payload.append({"task_id": task_id, "submitted_answer": submitted_answer})
-            results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": submitted_answer})
+            response = agent(question_text)
+            submitted_answer = json.loads(response)
+            answers_payload.append({"task_id": task_id, "submitted_answer": submitted_answer['answer']})
+            results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": submitted_answer['answer'] if submitted_answer['answer'] else None, "Reasoning": submitted_answer['reasoning'] if submitted_answer['reasoning'] else ""})
         except Exception as e:
-             print(f"Error running agent on task {task_id}: {e}")
-             results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": f"AGENT ERROR: {e}"})
+            print(f"Error running agent on task {task_id}: {e}")
+            results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": f"AGENT ERROR: {e}", "Reasoning": ""})
 
     if not answers_payload:
         print("Agent did not produce any answers to submit.")
@@ -111,6 +117,11 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
 
     # 5. Submit
     print(f"Submitting {len(answers_payload)} answers to: {submit_url}")
+    if debug:
+        print(f"Not really submitting. Just debugging. Submission Data: {submission_data}")
+        final_status = "Debug mode: Not submitting answers. Check console for submission data."
+        results_df = pd.DataFrame(results_log)
+        return final_status, results_df
     try:
         response = requests.post(submit_url, json=submission_data, timeout=60)
         response.raise_for_status()
@@ -177,7 +188,7 @@ with gr.Blocks() as demo:
 
     status_output = gr.Textbox(label="Run Status / Submission Result", lines=5, interactive=False)
     # Removed max_rows=10 from DataFrame constructor
-    results_table = gr.DataFrame(label="Questions and Agent Answers", wrap=True)
+    results_table = gr.DataFrame(label="Questions and Agent Answers", wrap=True, show_copy_button=True,)
 
     run_button.click(
         fn=run_and_submit_all,
